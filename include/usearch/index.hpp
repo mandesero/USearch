@@ -2814,8 +2814,12 @@ class index_gt {
         bool active_{};
         bool rolled_back_{};
         bool abort_after_reverse_{};
+        bool reused_{};
+        compressed_slot_t updated_slot_{};
+        vector_key_t old_key_{};
 
-        bool prepare(index_gt& index, level_t target) noexcept {
+        bool prepare(index_gt& index, level_t target, bool reused = false,
+                     compressed_slot_t slot = 0) noexcept {
             if (active_)
                 return false;
             old_size_ = index.size();
@@ -2824,15 +2828,20 @@ class index_gt {
             count_ = 0;
             recorded_ = 0;
             rolled_back_ = false;
+            reused_ = reused;
+            updated_slot_ = slot;
+            if (reused)
+                old_key_ = index.node_at_(slot).key();
             std::size_t levels = old_size_
                 ? static_cast<std::size_t>((std::min)(target, old_level_)) + 1
                 : 0;
             std::size_t neighbors = (std::max)(index.config_.connectivity,
                                                index.config_.connectivity_base);
             std::size_t max_size = (std::numeric_limits<std::size_t>::max)();
-            if (levels && index.config_.connectivity > max_size / levels)
+            std::size_t records_per_level = neighbors + (reused ? 1 : 0);
+            if (levels && records_per_level > max_size / levels)
                 return false;
-            capacity_ = levels * index.config_.connectivity;
+            capacity_ = levels * records_per_level;
             std::size_t overhead = sizeof(compressed_slot_t) +
                                    sizeof(level_t) + sizeof(neighbors_count_t);
             if (neighbors > (max_size - overhead) / sizeof(compressed_slot_t))
@@ -2890,11 +2899,15 @@ class index_gt {
                 std::memcpy(neighbors.tape(), in, sizeof(neighbors_count_t) +
                             capacity * sizeof(compressed_slot_t));
             }
-            index.node_free_(old_size_);
-            index.nodes_[old_size_] = node_t{};
-            index.nodes_count_ = old_size_;
-            index.entry_slot_ = old_entry_;
-            index.max_level_ = old_level_;
+            if (reused_)
+                index.node_at_(updated_slot_).key(old_key_);
+            else {
+                index.node_free_(old_size_);
+                index.nodes_[old_size_] = node_t{};
+                index.nodes_count_ = old_size_;
+                index.entry_slot_ = old_entry_;
+                index.max_level_ = old_level_;
+            }
             active_ = false;
             rolled_back_ = true;
         }
@@ -3096,8 +3109,11 @@ class index_gt {
         metric_at&& metric,                     //
         index_update_config_t config = {},      //
         callback_at&& callback = callback_at{}, //
-        prefetch_at&& prefetch = prefetch_at{}) usearch_noexcept_m {
+        prefetch_at&& prefetch = prefetch_at{},
+        add_undo_t* undo = nullptr) usearch_noexcept_m {
 
+        if (config.should_stop && !undo)
+            return add_result_t{}.failed("Undo required for interruptible update");
         // Someone is gonna fuzz this, so let's make sure we cover the basics
         if (!config.expansion)
             config.expansion = default_expansion_add();
@@ -3124,6 +3140,10 @@ class index_gt {
 
         node_t updated_node = node_at_(updated_slot);
         level_t updated_node_level = updated_node.level();
+        if (undo && !undo->prepare(*this, updated_node_level, true, updated_slot))
+            return result.failed("Out of memory!");
+        if (undo)
+            undo->active_ = true;
 
         // Copy entry coordinates under locks
         level_t max_level_copy;
@@ -3140,6 +3160,7 @@ class index_gt {
 
         // Go down the level, tracking only the closest match;
         // It may even be equal to the `updated_slot`
+        bool stopped = false;
         compressed_slot_t closest_slot =
             // If we are updating the entry node itself, it won't contain any neighbors,
             // so we should traverse a level down to find the closest match.
@@ -3147,13 +3168,21 @@ class index_gt {
                 ? entry_slot_copy
                 : search_for_one_(             //
                       value, metric, prefetch, //
-                      entry_slot_copy, max_level_copy, updated_node_level, context);
+                      entry_slot_copy, max_level_copy, updated_node_level, context,
+                      config.should_stop, config.stop_context, &stopped);
+        if (stopped || (config.should_stop && config.should_stop(config.stop_context))) {
+            undo->rollback(*this);
+            return result.failed("Update stopped");
+        }
 
         // From `updated_node_level` down - perform proper extensive search
         for (level_t level = (std::min)(updated_node_level, max_level_copy); level >= 0; --level) {
             if (!search_to_update_(value, metric, prefetch, closest_slot, updated_slot, level, config.expansion,
-                                   context))
-                return result.failed("Out of memory!");
+                                   context, config.should_stop, config.stop_context, &stopped)) {
+                if (undo)
+                    undo->rollback(*this);
+                return result.failed(stopped ? "Update stopped" : "Out of memory!");
+            }
 
             candidates_view_t closest_view;
             {
@@ -3161,12 +3190,24 @@ class index_gt {
                 // TODO: Go through existing neighbors removing reverse links
                 // for (compressed_slot_t slot : neighbors_(updated_node, level))
                 //     remove_link_(slot, updated_slot, level);
-                neighbors_(updated_node, level).clear();
+                neighbors_ref_t neighbors = neighbors_(updated_node, level);
+                if (undo)
+                    undo->record(updated_slot, level, neighbors,
+                                 level ? config_.connectivity : config_.connectivity_base);
+                neighbors.clear();
                 closest_view = form_links_to_closest_(metric, updated_slot, level, context);
                 if (closest_view.size())
                     closest_slot = closest_view[0].slot;
             }
-            form_reverse_links_(metric, updated_slot, closest_view, value, level, context);
+            if (!form_reverse_links_(metric, updated_slot, closest_view, value, level, context, undo,
+                                     config.should_stop, config.stop_context)) {
+                undo->rollback(*this);
+                return result.failed("Update stopped");
+            }
+            if (undo && undo->abort_after_reverse_) {
+                undo->rollback(*this);
+                return result.failed("Injected stop after reverse links");
+            }
         }
         if (static_cast<vector_key_t>(updated_node.key()) != key)
             updated_node.key(key);
@@ -4086,12 +4127,16 @@ class index_gt {
             usearch_assert_m(close_slot != new_slot, "Self-loops are impossible");
             usearch_assert_m(level <= close_node.level(), "Linking to missing level");
 
+            // Reusing a node can encounter an incoming edge left by its old value.
+            bool already_linked = false;
+            for (compressed_slot_t slot : close_header)
+                already_linked |= slot == new_slot;
+            if (already_linked)
+                continue;
             if (undo)
                 undo->record(close_slot, level, close_header,
                              connectivity_max);
 
-            // If `new_slot` is already present in the neighboring connections of `close_slot`
-            // then no need to modify any connections or run the heuristics.
             if (close_header.size() < connectivity_max) {
                 close_header.push_back(new_slot);
                 continue;
@@ -4333,7 +4378,8 @@ class index_gt {
     bool search_to_update_(                                           //
         value_at&& query, metric_at&& metric, prefetch_at&& prefetch, //
         compressed_slot_t start_slot, compressed_slot_t updated_slot, level_t level, std::size_t top_limit,
-        context_t& context) noexcept {
+        context_t& context, bool (*should_stop)(void*) = nullptr,
+        void* stop_context = nullptr, bool* stopped = nullptr) noexcept {
 
         visits_hash_set_t& visits = context.visits;
         next_candidates_t& next = context.next_candidates; // pop min, push
@@ -4359,7 +4405,11 @@ class index_gt {
 
         // The primary loop of the graph traversal
         while (!next.empty()) {
-
+            if (should_stop && should_stop(stop_context)) {
+                if (stopped)
+                    *stopped = true;
+                return false;
+            }
             candidate_t candidacy = next.top();
             if ((-candidacy.distance) > radius && top.size() == top_limit)
                 break;
@@ -4393,6 +4443,11 @@ class index_gt {
                 return false;
 
             for (compressed_slot_t successor_slot : candidate_neighbors) {
+                if (should_stop && should_stop(stop_context)) {
+                    if (stopped)
+                        *stopped = true;
+                    return false;
+                }
                 if (visits.set(successor_slot))
                     continue;
 
